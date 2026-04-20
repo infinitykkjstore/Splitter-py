@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import struct
 from pathlib import Path
 
 try:
@@ -15,17 +17,180 @@ except ImportError:  # pragma: no cover - standalone script compatibility
     from manifest import Manifest, PartMeta
 
 
+class LocalPKGMetadataExtractor:
+    """Extrator de metadados de PKG local (sem HTTP)"""
+
+    PKG_MAGIC = b'\x7FCNT'
+    PKG_HEADER_SIZE = 0x5A0
+    PKG_TABLE_ENTRY_SIZE = 0x20
+    PKG_CONTENT_ID_SIZE = 0x30
+
+    def __init__(self, file_path: str, verbose: bool = False):
+        self.file_path = Path(file_path)
+        self.verbose = verbose
+        self._file = None
+
+    def log(self, message: str, level: str = "INFO"):
+        if self.verbose or level == "ERROR":
+            prefix = {"INFO": "[INFO]", "SUCCESS": "[OK]", "ERROR": "[ERROR]", "WARN": "[WARN]", "DEBUG": "[DEBUG]"}.get(level, "[*]")
+            print(f"{prefix} {message}")
+
+    def _open(self):
+        self._file = open(self.file_path, 'rb')
+
+    def _close(self):
+        if self._file:
+            self._file.close()
+            self._file = None
+
+    def _read_range(self, start: int, end: int) -> bytes:
+        if not self._file:
+            self._open()
+        self._file.seek(start)
+        length = end - start + 1
+        return self._file.read(length)
+
+    def extract_metadata(self) -> dict:
+        """Extrai metadados completos do PKG local"""
+        try:
+            self.log("Iniciando extração de metadados do PKG local...", "INFO")
+
+            header_data = self._read_range(0, self.PKG_HEADER_SIZE - 1)
+            header = self._parse_header(header_data)
+
+            digest_sig_data = self._read_range(0xFE0, 0x10FF)
+            header['header_digest'] = digest_sig_data[0:32].hex().upper()
+            header['header_signature'] = digest_sig_data[32:].hex().upper()
+
+            entries = self._read_entry_table(header)
+            header['entries'] = entries
+
+            param_sfo_entry = next((e for e in entries if e['id'] == 0x1000), None)
+            if param_sfo_entry:
+                sfo_params = self._read_param_sfo_from_entry(header, param_sfo_entry)
+                header['params'] = sfo_params
+                header['title'] = sfo_params.get('TITLE', '')
+                header['title_id'] = sfo_params.get('TITLE_ID', '')
+                header['category'] = sfo_params.get('CATEGORY', '')
+                self.log(f"Title: {header['title']}", "SUCCESS")
+
+            self.log("Extração concluída!", "SUCCESS")
+            return header
+
+        finally:
+            self._close()
+
+    def _parse_header(self, data: bytes) -> dict:
+        header = {}
+
+        magic = data[0:4]
+        if magic != self.PKG_MAGIC:
+            raise Exception(f"Invalid PKG magic: {magic.hex()}")
+
+        header['magic'] = magic.decode('ascii', errors='ignore')
+        header['flags'] = struct.unpack('>I', data[0x04:0x08])[0]
+        header['entry_count'] = struct.unpack('>I', data[0x10:0x14])[0]
+        header['entry_table_offset'] = struct.unpack('>I', data[0x18:0x1C])[0]
+        header['main_ent_data_size'] = struct.unpack('>I', data[0x1C:0x20])[0]
+        header['body_offset'] = struct.unpack('>Q', data[0x20:0x28])[0]
+        header['body_size'] = struct.unpack('>Q', data[0x28:0x30])[0]
+
+        content_id_bytes = data[0x40:0x40 + self.PKG_CONTENT_ID_SIZE]
+        header['content_id'] = content_id_bytes.decode('ascii', errors='ignore').rstrip('\x00')
+
+        header['drm_type'] = struct.unpack('>I', data[0x70:0x74])[0]
+        header['content_type'] = struct.unpack('>I', data[0x74:0x78])[0]
+        header['package_size'] = struct.unpack('>Q', data[0x430:0x438])[0]
+
+        self.log(f"Package Size: {header['package_size']} bytes", "DEBUG")
+        self.log(f"Content ID: {header['content_id']}", "DEBUG")
+
+        return header
+
+    def _read_entry_table(self, header: dict) -> list:
+        table_offset = header['entry_table_offset']
+        table_size = header['entry_count'] * self.PKG_TABLE_ENTRY_SIZE
+
+        entry_data = self._read_range(table_offset, table_offset + table_size - 1)
+
+        entries = []
+        for i in range(header['entry_count']):
+            offset = i * self.PKG_TABLE_ENTRY_SIZE
+            entry_bytes = entry_data[offset:offset + self.PKG_TABLE_ENTRY_SIZE]
+
+            entry = {
+                'id': struct.unpack('>I', entry_bytes[0x00:0x04])[0],
+                'filename_offset': struct.unpack('>I', entry_bytes[0x04:0x08])[0],
+                'flags1': struct.unpack('>I', entry_bytes[0x08:0x0C])[0],
+                'flags2': struct.unpack('>I', entry_bytes[0x0C:0x10])[0],
+                'data_offset': struct.unpack('>I', entry_bytes[0x10:0x14])[0],
+                'data_size': struct.unpack('>I', entry_bytes[0x14:0x18])[0],
+            }
+            entries.append(entry)
+
+        return entries
+
+    def _read_param_sfo_from_entry(self, header: dict, entry: dict) -> dict:
+        sfo_offset = entry['data_offset']
+        sfo_size = entry['data_size']
+
+        sfo_data = self._read_range(sfo_offset, sfo_offset + sfo_size - 1)
+
+        if sfo_data[0:4] != b'\x00PSF':
+            raise Exception(f"Invalid SFO magic: {sfo_data[0:4].hex()}")
+
+        key_table_offset = struct.unpack('<I', sfo_data[8:12])[0]
+        data_table_offset = struct.unpack('<I', sfo_data[12:16])[0]
+        tables_entries = struct.unpack('<I', sfo_data[16:20])[0]
+
+        params = {}
+        for i in range(tables_entries):
+            entry_offset = 20 + (i * 16)
+            entry_bytes = sfo_data[entry_offset:entry_offset + 16]
+
+            key_offset = struct.unpack('<H', entry_bytes[0:2])[0]
+            param_fmt = struct.unpack('<H', entry_bytes[2:4])[0]
+            param_len = struct.unpack('<I', entry_bytes[4:8])[0]
+            data_offset_rel = struct.unpack('<I', entry_bytes[12:16])[0]
+
+            key_start = key_table_offset + key_offset
+            key_end = sfo_data.index(b'\x00', key_start)
+            key_name = sfo_data[key_start:key_end].decode('ascii')
+
+            value_start = data_table_offset + data_offset_rel
+
+            if param_fmt == 0x0004:
+                value_end = sfo_data.index(b'\x00', value_start)
+                value = sfo_data[value_start:value_end].decode('utf-8', errors='ignore')
+            elif param_fmt == 0x0404:
+                value = struct.unpack('<I', sfo_data[value_start:value_start + 4])[0]
+            else:
+                value_bytes = sfo_data[value_start:value_start + param_len]
+                value = value_bytes.decode('utf-8', errors='ignore').rstrip('\x00')
+
+            params[key_name] = value
+
+        return params
+
+
 def split_file(
     input_path: str,
     output_dir: str | None = None,
     part_size: int = DEFAULT_PART_SIZE,
     buffer_size: int = DEFAULT_BUFFER_SIZE,
     include_hashes: bool = False,
+    base_url: str | None = None,
+    is_pkg: bool = False,
 ) -> Path:
     """Split a file and create a JSON manifest.
 
     Returns the manifest path.
     """
+    def log(msg: str, level: str = "INFO"):
+        if is_pkg or level == "ERROR":
+            prefix = {"INFO": "[INFO]", "SUCCESS": "[OK]", "ERROR": "[ERROR]", "WARN": "[WARN]"}.get(level, "[*]")
+            print(f"{prefix} {msg}")
+
     if part_size <= 0:
         raise ValueError("part_size must be > 0")
     if buffer_size <= 0:
@@ -53,7 +218,8 @@ def split_file(
             part_path = out_dir / part_name
 
             part_hash = hashlib.sha256() if include_hashes else None
-            hashers = tuple(h for h in (part_hash, global_hash) if h is not None)
+            part_sha1 = hashlib.sha1() if is_pkg else None
+            hashers = tuple(h for h in (part_hash, part_sha1, global_hash) if h is not None)
 
             with part_path.open("wb") as dst:
                 copied = copy_exact_bytes(
@@ -73,6 +239,13 @@ def split_file(
             end = offset + copied - 1
             offset += copied
 
+            sha1_value = part_sha1.hexdigest() if part_sha1 else None
+
+            if is_pkg and base_url:
+                part_url = f"{base_url.rstrip('/')}/{part_name}"
+            else:
+                part_url = None
+
             parts.append(
                 PartMeta(
                     part=part_index,
@@ -81,19 +254,52 @@ def split_file(
                     end=end,
                     size=copied,
                     sha256=part_hash.hexdigest() if part_hash is not None else None,
+                    sha1=sha1_value,
+                    url=part_url,
                 )
             )
             part_index += 1
 
-    manifest = Manifest(
-        file_name=base_name,
-        file_size=file_size,
-        chunk_size=part_size,
-        parts=parts,
-        sha256=global_hash.hexdigest() if global_hash is not None else None,
-    )
-    manifest_path = out_dir / f"{base_name}.manifest.json"
-    manifest.save(manifest_path)
+    pkg_metadata = None
+    package_digest = None
+    if is_pkg:
+        log("Extraindo metadados do PKG...", "INFO")
+        pkg_extractor = LocalPKGMetadataExtractor(str(source), verbose=False)
+        pkg_metadata = pkg_extractor.extract_metadata()
+        package_digest = pkg_metadata.get('header_digest', '')
+
+    if is_pkg and base_url:
+        manifest_data = {
+            "originalFileSize": file_size,
+            "packageDigest": package_digest,
+            "numberOfSplitFiles": len(parts),
+            "pieces": []
+        }
+
+        for part in parts:
+            piece = {
+                "url": part.url,
+                "fileOffset": part.start,
+                "fileSize": part.size,
+                "hashValue": part.sha1.upper() if part.sha1 else ''
+            }
+            manifest_data["pieces"].append(piece)
+
+        manifest_path = out_dir / f"{base_name}.manifest.json"
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump(manifest_data, f, indent=2)
+        log(f"Manifesto PS4 salvo: {manifest_path}", "SUCCESS")
+    else:
+        manifest = Manifest(
+            file_name=base_name,
+            file_size=file_size,
+            chunk_size=part_size,
+            parts=parts,
+            sha256=global_hash.hexdigest() if global_hash is not None else None,
+        )
+        manifest_path = out_dir / f"{base_name}.manifest.json"
+        manifest.save(manifest_path)
+
     return manifest_path
 
 

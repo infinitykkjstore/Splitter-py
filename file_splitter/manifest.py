@@ -16,6 +16,8 @@ class PartMeta:
     end: int
     size: int
     sha256: str | None = None
+    sha1: str | None = None
+    url: str | None = None
 
     def to_dict(self) -> dict:
         payload = {
@@ -27,6 +29,10 @@ class PartMeta:
         }
         if self.sha256:
             payload["sha256"] = self.sha256
+        if self.sha1:
+            payload["sha1"] = self.sha1
+        if self.url:
+            payload["url"] = self.url
         return payload
 
     @classmethod
@@ -38,6 +44,8 @@ class PartMeta:
             end=int(payload["end"]),
             size=int(payload["size"]),
             sha256=payload.get("sha256"),
+            sha1=payload.get("sha1"),
+            url=payload.get("url"),
         )
 
 
